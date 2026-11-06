@@ -60,6 +60,7 @@ PLUGIN_NAME = "astrbot_plugin_dcqq_relay"
 RECOVERY_PREFIX = "[RECOVERY]"
 SELF_DELETE_TTL = 3600  # 自己触发的删除事件在 1 小时内忽略，避免撤回互相反弹
 BIND_CODE_TTL = 300  # 聊天绑定码有效期（秒）
+DISCORD_EMOJI_RE = re.compile(r"<(a?):([A-Za-z0-9_]+):(\d+)>")
 MAX_TRANSLATE_CACHE = 512
 
 
@@ -1359,6 +1360,7 @@ class DCQQRelayPlugin(Star):
         self._listener_client_id: int | None = None
         self._attach_running = False
         self._bind_codes: dict[str, dict] = {}
+        self._emoji_cache: dict[str, bytes] = {}
 
     # -- 生命周期 -----------------------------------------------------------
     async def initialize(self) -> None:
@@ -1786,7 +1788,7 @@ class DCQQRelayPlugin(Star):
 
         text = self._format_discord_text(message)
         if text:
-            parts.append(Comp.Plain(text))
+            parts.extend(await self._content_to_parts(text))
 
         for attachment in getattr(message, "attachments", None) or []:
             component = await self._discord_attachment(attachment, relation)
@@ -1851,12 +1853,59 @@ class DCQQRelayPlugin(Star):
                 f"<#{channel.id}>", f"#{getattr(channel, 'name', '频道')}"
             )
 
-        content = re.sub(r"<a?:([A-Za-z0-9_]+):\d+>", r"[表情:\1]", content)
-
         if self.config.get("ignore_at_all", True):
             content = re.sub(r"@(everyone|here)\b", "", content)
 
+        # 表情被拿走后可能在原位置留下多余空格，压缩一下（不影响换行）
+        content = re.sub(r"[ \t]{2,}", " ", content)
+
+        # 注意：自定义表情 <:name:id> 不在这里转文字，
+        # 由 _content_to_parts 转成图片后再拼进消息链。
         return content.strip()
+
+    async def _content_to_parts(self, content: str) -> list[Any]:
+        """把 Discord 文本拆成「文字 + 自定义表情图片」。
+
+        自定义表情（<:name:id> / <a:name:id>）会下载成图片发给 QQ，
+        避免 QQ 侧只看到一串不可读的 [表情:...] 文本。
+        """
+        parts: list[Any] = []
+        position = 0
+        for match in DISCORD_EMOJI_RE.finditer(content):
+            before = content[position : match.start()]
+            if before.strip():
+                parts.append(Comp.Plain(before))
+            parts.append(
+                await self._emoji_component(
+                    animated=bool(match.group(1)),
+                    name=match.group(2),
+                    emoji_id=match.group(3),
+                )
+            )
+            position = match.end()
+        tail = content[position:]
+        if tail.strip():
+            parts.append(Comp.Plain(tail))
+        return parts
+
+    async def _emoji_component(self, animated: bool, name: str, emoji_id: str) -> Any:
+        """把 Discord 自定义表情转成 QQ 可发送的图片段。"""
+        cache_key = f"{'a' if animated else 's'}:{emoji_id}"
+        data = self._emoji_cache.get(cache_key)
+        if data is None and self.http is not None:
+            suffix = "gif" if animated else "png"
+            url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{suffix}?size=48"
+            data = await self.http.get_bytes(url)
+            if data:
+                if len(self._emoji_cache) >= 200:
+                    self._emoji_cache.clear()
+                self._emoji_cache[cache_key] = data
+        if data:
+            return Comp.Image(file=f"base64://{base64.b64encode(data).decode()}")
+        logger.debug(
+            "[dcqq-relay] Discord 表情下载失败，回退为文本（%s / %s）", name, emoji_id
+        )
+        return Comp.Plain(f"[表情:{name}]")
 
     @staticmethod
     def _format_discord_embeds(message) -> str:
@@ -2145,7 +2194,10 @@ class DCQQRelayPlugin(Star):
                 if username and username != display
                 else f"@{username or display}"
             )
-            parts = [Comp.Plain(content + "\n(edited)")]
+            if self.config.get("ignore_at_all", True):
+                content = re.sub(r"@(everyone|here)\b", "", content)
+            parts = await self._content_to_parts(content)
+            parts.append(Comp.Plain("\n(edited)"))
             parts = await self._translate_parts(parts, "dc2qq")
             ids = await self.qq.send(
                 relation, [Comp.Plain(f"{label}: \n")] + parts

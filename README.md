@@ -201,7 +201,7 @@ Discord 频道 ──► 适配器事件 ──► 解析昵称/文本/附件/�
 - **历史恢复的 QQ 侧**：依赖协议端的 `get_group_msg_history`（NapCat / Lagrange 等支持）。协议端不支持时只同步 Discord 侧历史，并在日志中提示。
 - **文件大小**：超过 `advanced.max_file_mb` 的附件会跳过并留下占位文本。
 - **QQ 语音**：Discord 只能以文件形式发送（如 `.amr`），不做格式转码。
-- **Discord 表情**：自定义表情转成 `[表情:名称]` 文本，不下载成图片。
+- **Discord 自定义表情**：会下载成图片（GIF/PNG）再发到 QQ，QQ 里看到的是表情图而不是文字；只有下载失败时才回退成 `[表情:名称]`。Unicode emoji（😀 等）直接作为文字转发。
 - **`/relay_recovery` 需要管理员**：AstrBot 管理员或 `admin_ids` 中的用户。
 - 原版的 `recovery` / `qqEmojiIndex` / `downloadAsset` / `showQQId` / `reverseName` 均已对应实现。
 
@@ -224,6 +224,10 @@ Discord 频道 ──► 适配器事件 ──► 解析昵称/文本/附件/�
 - 确认 AstrBot 所在机器能访问 `gchat.qpic.cn` / `multimedia.nt.qq.com.cn` 等 QQ 图片域名
 - 确认协议端（NapCat / Lagrange）版本支持 `get_image`
 - Discord → QQ 方向图片发不出去时，打开该关系的 `download_asset`，插件会先下载再用 base64 发送
+
+### Discord 自定义表情在 QQ 里显示成 `[表情:xxx]`
+
+说明表情图片下载失败。插件会从 `https://cdn.discordapp.com/emojis/{id}.png|gif` 下载后以图片发送，下载不通时才回退成文本。检查 AstrBot 所在机器能否访问 `cdn.discordapp.com`，日志里会有 `Discord 表情下载失败` 的 debug 记录。
 
 ### 消息发出去了但昵称/头像是机器人
 
