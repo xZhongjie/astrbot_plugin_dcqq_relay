@@ -207,6 +207,30 @@ Discord 频道 ──► 适配器事件 ──► 解析昵称/文本/附件/�
 
 ---
 
+## 常见问题
+
+### QQ 图片在 Discord 显示成 `[图片]`
+
+说明插件没能拿到可下载的图片地址。插件会依次尝试：
+
+1. AstrBot 自带的 `Image.convert_to_base64()`（支持 URL / base64 / 本地路径）
+2. 组件里的 `url`、`file`、`path` 等所有候选地址（自动还原 `&amp;` 转义，使用浏览器 UA 下载）
+3. 若只有裸文件名，调用协议端的 `get_image` 换取真实链接
+4. 仍然失败则发送原始链接（Discord 会自动展开预览），最后才退化成 `[图片]`
+
+排查步骤：
+
+- 在 AstrBot 日志里搜 `[dcqq-relay] 图片下载失败`，会打印失败原因和候选地址
+- 确认 AstrBot 所在机器能访问 `gchat.qpic.cn` / `multimedia.nt.qq.com.cn` 等 QQ 图片域名
+- 确认协议端（NapCat / Lagrange）版本支持 `get_image`
+- Discord → QQ 方向图片发不出去时，打开该关系的 `download_asset`，插件会先下载再用 base64 发送
+
+### 消息发出去了但昵称/头像是机器人
+
+说明 Webhook 不可用（缺少「管理 Webhook」权限，或频道是公告/论坛等特殊类型）。插件会自动回退，并在 `/relay_status` 里显示「已尝试但不可用」。
+
+---
+
 ## 许可证
 
 本项目遵循 **Apache License 2.0**，与上游 `koishi-plugin-dcqq-relay` 保持一致。

@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import datetime as dt
+import html
 import json
 import os
 import random
@@ -376,24 +377,55 @@ class HttpClient:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=90)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            headers = {
+                # 部分 QQ / Discord CDN 会拒绝非浏览器 UA
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            }
+            self._session = aiohttp.ClientSession(timeout=timeout, headers=headers)
         return self._session
 
     async def get_bytes(self, url: str) -> bytes | None:
         if not url:
             return None
+        url = html.unescape(str(url).strip())
+
         if url.startswith("base64://"):
             try:
                 data = base64.b64decode(url[len("base64://") :])
             except Exception:
                 return None
             return data if len(data) <= self.max_bytes else None
+
+        if url.startswith("data:"):
+            header, _, payload = url.partition(",")
+            if ";base64" in header:
+                try:
+                    data = base64.b64decode(payload)
+                except Exception:
+                    return None
+                return data if len(data) <= self.max_bytes else None
+            return None
+
         if url.startswith("file://"):
             path = Path(uri_to_path(url))
             if path.is_file() and path.stat().st_size <= self.max_bytes:
                 return await asyncio.to_thread(path.read_bytes)
             return None
+
+        # 兼容只有路径 / 只有文件名的本地资源
         if not url.startswith(("http://", "https://")):
+            path = Path(uri_to_path(url))
+            try:
+                if path.is_file() and path.stat().st_size <= self.max_bytes:
+                    return await asyncio.to_thread(path.read_bytes)
+            except OSError:
+                pass
             return None
 
         session = await self._get_session()
@@ -404,7 +436,7 @@ class HttpClient:
                     logger.warning(
                         "[dcqq-relay] 跳过超大文件（%s 字节）：%s",
                         resp.content_length,
-                        url,
+                        url[:200],
                     )
                     return None
                 data = await resp.content.read(self.max_bytes + 1)
@@ -412,7 +444,7 @@ class HttpClient:
                     return None
                 return data
         except Exception as exc:
-            logger.warning("[dcqq-relay] 下载资源失败：%s（%s）", url, exc)
+            logger.warning("[dcqq-relay] 下载资源失败：%s（%s）", url[:200], exc)
             return None
 
     async def get_json(self, url: str) -> Any:
@@ -841,36 +873,148 @@ class DiscordSide:
             elif isinstance(seg, Comp.Reply):
                 payload.reference_id = str(seg.id)
             elif isinstance(seg, Comp.Image):
-                ref = seg.url or seg.file or ""
-                if not await self._add_media(
-                    ref, self._media_name(ref, "image.png"), parts, payload.files
-                ):
-                    parts.append("[图片]")
+                data = await self._component_bytes(seg)
+                if data:
+                    self._append_file(
+                        data,
+                        self._media_name(self._first_ref(seg), "image.png"),
+                        payload.files,
+                    )
+                else:
+                    parts.append(self._media_fallback(seg, "图片"))
             elif isinstance(seg, Comp.Record):
-                ref = seg.url or seg.file or ""
-                if not await self._add_media(
-                    ref, self._media_name(ref, "voice.wav"), parts, payload.files
-                ):
-                    parts.append("[语音]")
+                data = await self._component_bytes(seg)
+                if data:
+                    self._append_file(
+                        data,
+                        self._media_name(self._first_ref(seg), "voice.wav"),
+                        payload.files,
+                    )
+                else:
+                    parts.append(self._media_fallback(seg, "语音"))
             elif isinstance(seg, Comp.Video):
-                ref = seg.url or seg.file or ""
-                if not await self._add_media(
-                    ref, self._media_name(ref, "video.mp4"), parts, payload.files
-                ):
-                    parts.append("[视频]")
+                data = await self._component_bytes(seg)
+                if data:
+                    self._append_file(
+                        data,
+                        self._media_name(self._first_ref(seg), "video.mp4"),
+                        payload.files,
+                    )
+                else:
+                    parts.append(self._media_fallback(seg, "视频"))
             elif isinstance(seg, Comp.File):
-                ref = seg.url or getattr(seg, "file_", "") or ""
-                if not await self._add_media(
-                    ref,
-                    seg.name or self._media_name(ref, "file.bin"),
-                    parts,
-                    payload.files,
-                ):
+                data = await self._component_bytes(seg)
+                if data:
+                    self._append_file(
+                        data,
+                        seg.name or self._media_name(self._first_ref(seg), "file.bin"),
+                        payload.files,
+                    )
+                else:
                     parts.append(f"[文件: {seg.name or '未知'}]")
         payload.content = "".join(parts).strip()
         if not payload.content and not payload.files:
             return None
         return payload
+
+    @staticmethod
+    def _append_file(data: bytes, filename: str, files: list[Any]) -> bool:
+        if len(files) >= 10:
+            return False
+        files.append(discord.File(BytesIO(data), filename=filename))
+        return True
+
+    # -- 媒体解析 -----------------------------------------------------------
+    @staticmethod
+    def _first_ref(seg: Any) -> str:
+        attrs = ("url", "file_", "path") if isinstance(seg, Comp.File) else ("url", "file", "path")
+        for attr in attrs:
+            value = getattr(seg, attr, None)
+            if isinstance(value, str) and value:
+                return value
+        return ""
+
+    @staticmethod
+    def _candidates(seg: Any) -> list[str]:
+        """收集所有可能的资源引用，去掉重复并还原 HTML 转义。"""
+        if isinstance(seg, Comp.File):
+            attrs = ("url", "file_", "path")
+        else:
+            attrs = ("url", "file", "path")
+        values: list[str] = []
+        for attr in attrs:
+            value = getattr(seg, attr, None)
+            if isinstance(value, str) and value.strip():
+                values.append(html.unescape(value.strip()))
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in values:
+            if value not in seen:
+                seen.add(value)
+                out.append(value)
+        return out
+
+    def _media_fallback(self, seg: Any, kind: str) -> str:
+        """下载失败时的占位：能拿到 http 链接就发链接，Discord 会自动展开预览。"""
+        for value in self._candidates(seg):
+            if value.startswith(("http://", "https://")):
+                logger.warning(
+                    "[dcqq-relay] %s下载失败，已回退为原始链接（%s）", kind, value[:200]
+                )
+                return f"\n{value}"
+        logger.warning(
+            "[dcqq-relay] %s下载失败且没有可用链接，已用占位文本（type=%s, refs=%s）",
+            kind,
+            type(seg).__name__,
+            self._candidates(seg)[:3],
+        )
+        return f"[{kind}]"
+
+    async def _component_bytes(self, seg: Any) -> bytes | None:
+        """把消息组件转换成字节。
+
+        优先使用 AstrBot 组件自带的解析（支持 url / base64 / 本地路径 / 各平台特殊格式），
+        失败后再用插件自己的 Http 客户端逐个候选地址下载。
+        """
+        max_bytes = (
+            self.plugin.http.max_bytes if self.plugin.http is not None else 20 * 1024 * 1024
+        )
+
+        # 1) AstrBot 组件解析
+        try:
+            if isinstance(seg, Comp.Image):
+                convert = getattr(seg, "convert_to_base64", None)
+                if callable(convert):
+                    base64_data = await convert()
+                    if base64_data:
+                        data = base64.b64decode(base64_data)
+                        if data and len(data) <= max_bytes:
+                            return data
+            elif isinstance(seg, (Comp.Record, Comp.Video)):
+                convert = getattr(seg, "convert_to_file_path", None)
+                if callable(convert):
+                    path = await convert()
+                    if path:
+                        file_path = Path(path)
+                        if file_path.is_file() and file_path.stat().st_size <= max_bytes:
+                            return await asyncio.to_thread(file_path.read_bytes)
+            elif isinstance(seg, Comp.File):
+                getter = getattr(seg, "get_file", None)
+                if callable(getter):
+                    path = await getter()
+                    if path:
+                        file_path = Path(path)
+                        if file_path.is_file() and file_path.stat().st_size <= max_bytes:
+                            return await asyncio.to_thread(file_path.read_bytes)
+        except Exception as exc:
+            logger.debug("[dcqq-relay] AstrBot 组件解析失败，尝试手动下载：%s", exc)
+
+        # 2) 手动下载所有候选地址
+        for candidate in self._candidates(seg):
+            data = await self.plugin.http.get_bytes(candidate)
+            if data:
+                return data
+        return None
 
     @staticmethod
     def _media_name(url: str, default: str) -> str:
@@ -880,22 +1024,6 @@ class DiscordSide:
         if "." not in os.path.basename(name):
             return default
         return name
-
-    async def _add_media(
-        self, url: str, filename: str, parts: list[str], files: list[Any]
-    ) -> bool:
-        if not url:
-            return False
-        if len(files) >= 10:
-            parts.append("\n[附件数量超过 Discord 单条上限，已省略]")
-            return False
-        data = await self.plugin.http.get_bytes(url)
-        if data is None:
-            if url.startswith("http"):
-                parts.append(f"\n[附件]({url})")
-            return False
-        files.append(discord.File(BytesIO(data), filename=filename))
-        return True
 
     async def _get_webhook(self, channel):
         if discord is None or self._webhook_unavailable:
@@ -1788,17 +1916,20 @@ class DCQQRelayPlugin(Star):
                 )
                 parts.append(Comp.Plain(f"[{description}]"))
             elif isinstance(seg, Comp.Image):
-                parts.append(Comp.Image(file=seg.url or seg.file))
+                ref = await self._resolve_media_ref(relation, seg, "image")
+                parts.append(
+                    Comp.Image(file=ref, url=ref if ref.startswith("http") else "")
+                )
             elif isinstance(seg, Comp.Record):
-                ref = seg.url or seg.file or ""
+                ref = await self._resolve_media_ref(relation, seg, "record")
                 suffix = os.path.splitext(guess_filename(ref, ""))[1] or ".amr"
                 parts.append(Comp.File(name=f"语音{suffix}", url=ref))
             elif isinstance(seg, Comp.Video):
-                parts.append(Comp.File(name="视频.mp4", url=seg.url or seg.file))
+                ref = await self._resolve_media_ref(relation, seg, "video")
+                parts.append(Comp.File(name="视频.mp4", url=ref))
             elif isinstance(seg, Comp.File):
-                parts.append(
-                    Comp.File(name=seg.name or "文件", url=seg.url or seg.file_)
-                )
+                ref = await self._resolve_media_ref(relation, seg, "file")
+                parts.append(Comp.File(name=seg.name or "文件", url=ref))
             elif isinstance(seg, Comp.Reply):
                 if self.store is None:
                     continue
@@ -1812,6 +1943,47 @@ class DCQQRelayPlugin(Star):
             else:
                 continue
         return parts
+
+    async def _resolve_media_ref(
+        self, relation: Relation, seg: Any, kind: str
+    ) -> str:
+        """把消息组件的资源引用解析成可直接下载的地址。
+
+        有些 OneBot 实现（如部分 NapCat / go-cqhttp 配置）的图片段只有裸文件名，
+        没有 http url，这时调用协议端的 get_image 换取真实链接。
+        """
+        candidates = DiscordSide._candidates(seg)
+        for value in candidates:
+            if value.startswith(("http://", "https://", "base64://", "data:", "file://")):
+                return value
+            try:
+                if Path(uri_to_path(value)).is_file():
+                    return value
+            except OSError:
+                continue
+
+        ref = DiscordSide._first_ref(seg)
+        if not ref or self.qq is None:
+            return ""
+        client = self.qq.client(relation.forward_platform)
+        if client is None:
+            return ""
+        action = {"image": "get_image", "record": "get_record"}.get(kind)
+        if not action:
+            return ""
+        try:
+            ret = await client.call_action(action, file=ref)
+        except Exception as exc:
+            logger.debug("[dcqq-relay] %s 解析媒体失败（%s）：%s", action, ref[:80], exc)
+            return ""
+        if isinstance(ret, dict):
+            url = ret.get("url") or ret.get("file")
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                logger.info(
+                    "[dcqq-relay] 已通过 %s 解析出媒体链接（%s）", action, ref[:60]
+                )
+                return url
+        return ""
 
     async def _translate_parts(self, parts: list[Any], direction: str) -> list[Any]:
         if self.translator is None:
