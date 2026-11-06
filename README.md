@@ -134,6 +134,7 @@ Discord 频道  /完成绑定 483920   → ✅ 绑定完成，双向同步生效
 | `translation.timeout` | `30` | 单次翻译超时（秒） |
 | `advanced.max_file_mb` | `20` | 单个媒体文件大小上限 |
 | `advanced.max_discord_chars` | `1900` | Discord 单条消息字符上限 |
+| `advanced.proxy` | 空 | 媒体下载代理；留空时 Discord 域名自动复用适配器的 `discord_proxy` |
 | `advanced.delete_sync` | `true` | 同步撤回 / 删除 |
 | `advanced.edit_sync` | `true` | 同步 Discord 消息编辑 |
 | `advanced.emoji_index_url` | QFace 索引 | QQ 表情名称索引地址 |

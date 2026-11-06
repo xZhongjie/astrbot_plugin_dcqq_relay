@@ -369,11 +369,20 @@ def sanitize_webhook_username(name: str) -> str:
 
 
 class HttpClient:
-    """复用 aiohttp session 的小封装，带体积上限。"""
+    """复用 aiohttp session 的小封装，带体积上限与按 URL 选择代理。"""
 
-    def __init__(self, max_bytes: int) -> None:
+    def __init__(self, max_bytes: int, proxy_resolver=None) -> None:
         self.max_bytes = max_bytes
+        self._proxy_resolver = proxy_resolver
         self._session: aiohttp.ClientSession | None = None
+
+    def _proxy_for(self, url: str) -> str | None:
+        if self._proxy_resolver is None:
+            return None
+        try:
+            return self._proxy_resolver(url)
+        except Exception:
+            return None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -430,8 +439,9 @@ class HttpClient:
             return None
 
         session = await self._get_session()
+        proxy = self._proxy_for(url)
         try:
-            async with session.get(url) as resp:
+            async with session.get(url, proxy=proxy) as resp:
                 resp.raise_for_status()
                 if resp.content_length and resp.content_length > self.max_bytes:
                     logger.warning(
@@ -451,7 +461,7 @@ class HttpClient:
     async def get_json(self, url: str) -> Any:
         session = await self._get_session()
         try:
-            async with session.get(url) as resp:
+            async with session.get(url, proxy=self._proxy_for(url)) as resp:
                 resp.raise_for_status()
                 return await resp.json(content_type=None)
         except Exception as exc:
@@ -1366,7 +1376,9 @@ class DCQQRelayPlugin(Star):
     async def initialize(self) -> None:
         self._data_dir = StarTools.get_data_dir(PLUGIN_NAME)
         max_mb = int((self.config.get("advanced") or {}).get("max_file_mb") or 20)
-        self.http = HttpClient(max_mb * 1024 * 1024)
+        self.http = HttpClient(
+            max_mb * 1024 * 1024, proxy_resolver=self._download_proxy
+        )
         self.store = RelayStore(self._data_dir / "relay.db")
         await self.store.init()
 
@@ -1460,6 +1472,33 @@ class DCQQRelayPlugin(Star):
                 await asyncio.sleep(2)
         finally:
             self._attach_running = False
+
+    def _download_proxy(self, url: str) -> str | None:
+        """下载媒体时使用的代理。
+
+        - 配置了 advanced.proxy 时全局使用；
+        - 否则只对 Discord 域名自动复用 Discord 适配器的 discord_proxy，
+          避免把 QQ 图片请求也绕进代理。
+        """
+        configured = str((self.config.get("advanced") or {}).get("proxy") or "").strip()
+        if configured:
+            return configured
+
+        host = (urlparse(url).hostname or "").lower()
+        if not host.endswith(
+            ("discordapp.com", "discordapp.net", "discord.com", "discord.gg")
+        ):
+            return None
+
+        inst = self.discord_platform()
+        if inst is None:
+            return None
+        platform_config = getattr(inst, "config", None) or {}
+        try:
+            proxy = str(platform_config.get("discord_proxy") or "").strip()
+        except Exception:
+            return None
+        return proxy or None
 
     # -- 事件入口 -----------------------------------------------------------
     @filter.event_message_type(filter.EventMessageType.ALL)

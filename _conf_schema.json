@@ -202,6 +202,12 @@
         "default": 1900,
         "slider": {"min": 500, "max": 2000, "step": 100}
       },
+      "proxy": {
+        "description": "媒体下载代理",
+        "type": "string",
+        "default": "",
+        "hint": "留空时只对 Discord 域名自动复用 Discord 适配器的 discord_proxy；填写后所有媒体下载都走该代理，例如 http://127.0.0.1:7890。"
+      },
       "delete_sync": {
         "description": "同步撤回/删除",
         "type": "bool",
