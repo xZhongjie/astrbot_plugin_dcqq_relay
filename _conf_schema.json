@@ -1,0 +1,223 @@
+{
+  "enabled": {
+    "description": "插件总开关",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后不再同步任何消息，但指令仍然可用。"
+  },
+  "relations": {
+    "description": "互通关系",
+    "type": "template_list",
+    "default": [],
+    "hint": "一条关系 = 一个 Discord 频道 ⇄ 一个 QQ 群/私聊，双向同时生效，不需要分别配置两个方向。",
+    "templates": {
+      "relation": {
+        "name": "Discord ⇄ QQ 互通关系",
+        "hint": "两个方向共用这一条配置",
+        "display_item": "name",
+        "items": {
+          "name": {
+            "description": "关系名称",
+            "type": "string",
+            "default": "主群互通",
+            "hint": "仅用于日志和 /relay_status 展示。"
+          },
+          "discord_guild_id": {
+            "description": "Discord 服务器 ID",
+            "type": "string",
+            "default": "",
+            "hint": "可选。右键服务器 → 复制服务器 ID。"
+          },
+          "discord_channel_id": {
+            "description": "Discord 频道 ID",
+            "type": "string",
+            "default": "",
+            "hint": "必填。右键频道 → 复制频道 ID（需开启开发者模式）。"
+          },
+          "forward_platform": {
+            "description": "QQ 侧平台适配器 ID",
+            "type": "string",
+            "default": "aiocqhttp",
+            "hint": "填 WebUI「消息平台」里该适配器实例的 ID，通常是 aiocqhttp / telegram / kook 等。"
+          },
+          "forward_channel": {
+            "description": "QQ 群号 / 私聊账号",
+            "type": "string",
+            "default": "",
+            "hint": "必填。群聊填群号，私聊填对方 QQ 号。"
+          },
+          "forward_message_type": {
+            "description": "QQ 侧会话类型",
+            "type": "string",
+            "default": "GroupMessage",
+            "options": ["GroupMessage", "FriendMessage"],
+            "labels": ["群聊", "私聊"],
+            "hint": "群聊选 GroupMessage，私聊选 FriendMessage。"
+          },
+          "show_forward_id": {
+            "description": "在 Discord 显示 QQ 号",
+            "type": "bool",
+            "default": true,
+            "hint": "开启后 QQ 用户的消息前缀会带有 [QQ:123456]。"
+          },
+          "download_asset": {
+            "description": "本地下载资源后再转发到 QQ",
+            "type": "bool",
+            "default": false,
+            "hint": "Discord 的图片/文件 CDN 可能被 QQ 侧拦截，开启后会先下载再以 base64 发送，速度略慢。"
+          },
+          "reverse_name": {
+            "description": "多媒体的用户名后置",
+            "type": "bool",
+            "default": false,
+            "hint": "当消息只有图片/视频而没有文字时，把用户名放在内容之后（适配 QQ 的显示习惯）。"
+          }
+        }
+      }
+    }
+  },
+  "discord_platform_id": {
+    "description": "Discord 平台实例 ID",
+    "type": "string",
+    "default": "",
+    "hint": "留空则自动查找第一个 discord 适配器。多个 Discord 机器人时请填写具体 ID。"
+  },
+  "ignore_at_all": {
+    "description": "忽略 @全体成员",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，转发时会丢弃 @全体成员 / @everyone / @here，避免跨平台刷屏。"
+  },
+  "suppress_llm": {
+    "description": "互通消息不唤醒 LLM",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，被转发的消息不会触发 AstrBot 的默认 AI 回复（指令仍然可用）。"
+  },
+  "admin_ids": {
+    "description": "额外管理员 ID",
+    "type": "list",
+    "default": [],
+    "hint": "这些用户可以使用 /relay_recovery 等管理指令（AstrBot 管理员默认也有权限）。"
+  },
+  "recovery_platforms": {
+    "description": "启动后进入恢复模式的平台",
+    "type": "list",
+    "default": [],
+    "hint": "填写平台适配器 ID（如 aiocqhttp）。启动后这些平台的新消息会先积压，直到执行 /relay_recovery 完成历史同步。"
+  },
+  "discord_webhook": {
+    "description": "Discord Webhook 身份",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "使用 Webhook 显示 QQ 昵称与头像",
+        "type": "bool",
+        "default": true,
+        "hint": "需要机器人在该频道拥有「管理 Webhook」权限；失败会自动回退为机器人身份发送。"
+      },
+      "name": {
+        "description": "Webhook 名称",
+        "type": "string",
+        "default": "DCQQ Relay",
+        "hint": "插件会自动查找/创建同名 Webhook 并复用。"
+      },
+      "nickname_template": {
+        "description": "昵称模板",
+        "type": "string",
+        "default": "{name}",
+        "hint": "可用变量：{name} 昵称、{id} QQ号、{platform} 平台名。"
+      },
+      "show_avatar": {
+        "description": "显示 QQ 头像",
+        "type": "bool",
+        "default": true,
+        "hint": "QQ 头像通过 qlogo 地址提供，仅 aiocqhttp 等 QQ 平台有效。"
+      }
+    }
+  },
+  "translation": {
+    "description": "自动翻译",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用自动翻译",
+        "type": "bool",
+        "default": false,
+        "hint": "使用 AstrBot 已配置的聊天模型进行翻译。"
+      },
+      "provider_id": {
+        "description": "翻译使用的模型提供商",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "留空则使用当前会话默认的聊天模型。"
+      },
+      "to_discord_language": {
+        "description": "转发到 Discord 的目标语言",
+        "type": "string",
+        "default": "English",
+        "hint": "留空表示 QQ → Discord 方向不翻译。"
+      },
+      "to_qq_language": {
+        "description": "转发到 QQ 的目标语言",
+        "type": "string",
+        "default": "简体中文",
+        "hint": "留空表示 Discord → QQ 方向不翻译。"
+      },
+      "show_original": {
+        "description": "同时保留原文",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后译文下方会附带原文。"
+      },
+      "max_chars": {
+        "description": "单段最大翻译字符数",
+        "type": "int",
+        "default": 1500,
+        "slider": {"min": 100, "max": 4000, "step": 100},
+        "hint": "超过该长度的文本不翻译，直接原样转发。"
+      },
+      "timeout": {
+        "description": "翻译超时（秒）",
+        "type": "int",
+        "default": 30,
+        "slider": {"min": 5, "max": 120, "step": 5}
+      }
+    }
+  },
+  "advanced": {
+    "description": "高级选项",
+    "type": "object",
+    "items": {
+      "max_file_mb": {
+        "description": "单个文件大小上限（MB）",
+        "type": "int",
+        "default": 20,
+        "slider": {"min": 1, "max": 100, "step": 1}
+      },
+      "max_discord_chars": {
+        "description": "Discord 单条消息字符上限",
+        "type": "int",
+        "default": 1900,
+        "slider": {"min": 500, "max": 2000, "step": 100}
+      },
+      "delete_sync": {
+        "description": "同步撤回/删除",
+        "type": "bool",
+        "default": true
+      },
+      "edit_sync": {
+        "description": "同步 Discord 消息编辑",
+        "type": "bool",
+        "default": true
+      },
+      "emoji_index_url": {
+        "description": "QQ 表情名称索引地址",
+        "type": "string",
+        "default": "https://koishi.js.org/QFace/assets/qq_emoji/_index.v2.json",
+        "hint": "用于把 QQ 表情 ID 转成可读文字；下载失败时会使用内置常用表情表。"
+      }
+    }
+  }
+}

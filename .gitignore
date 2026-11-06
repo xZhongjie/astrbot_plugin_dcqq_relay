@@ -1,0 +1,21 @@
+# 运行数据
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
