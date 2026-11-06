@@ -9,7 +9,7 @@
     "description": "互通关系",
     "type": "template_list",
     "default": [],
-    "hint": "一条关系 = 一个 Discord 频道 ⇄ 一个 QQ 群/私聊，双向同时生效，不需要分别配置两个方向。",
+    "hint": "一条关系 = 一个 Discord 频道 ⇄ 一个 QQ 群/私聊，双向同时生效，不需要分别配置两个方向。也可以直接在聊天里用 /绑定 + /完成绑定 自动生成。",
     "templates": {
       "relation": {
         "name": "Discord ⇄ QQ 互通关系",

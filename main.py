@@ -23,6 +23,7 @@ import base64
 import datetime as dt
 import json
 import os
+import random
 import re
 import sqlite3
 import time
@@ -57,6 +58,7 @@ except Exception:  # pragma: no cover - 可选依赖
 PLUGIN_NAME = "astrbot_plugin_dcqq_relay"
 RECOVERY_PREFIX = "[RECOVERY]"
 SELF_DELETE_TTL = 3600  # 自己触发的删除事件在 1 小时内忽略，避免撤回互相反弹
+BIND_CODE_TTL = 300  # 聊天绑定码有效期（秒）
 MAX_TRANSLATE_CACHE = 512
 
 
@@ -1228,6 +1230,7 @@ class DCQQRelayPlugin(Star):
         self._recovering = False
         self._listener_client_id: int | None = None
         self._attach_running = False
+        self._bind_codes: dict[str, dict] = {}
 
     # -- 生命周期 -----------------------------------------------------------
     async def initialize(self) -> None:
@@ -1446,9 +1449,22 @@ class DCQQRelayPlugin(Star):
     @staticmethod
     def _is_own_command(event: AstrMessageEvent) -> bool:
         text = (event.message_str or "").strip()
-        for name in ("relay", "relay_status", "relay_recovery"):
-            if text == f"/{name}" or text.startswith(f"/{name} "):
-                return True
+        names = (
+            "relay",
+            "relay_status",
+            "relay_recovery",
+            "绑定",
+            "完成绑定",
+            "解绑",
+            "bind",
+            "bindcode",
+            "complete_bind",
+            "unbind",
+        )
+        for name in names:
+            for candidate in (name, f"/{name}"):
+                if text == candidate or text.startswith(f"{candidate} "):
+                    return True
         return False
 
     async def _is_relayed(
@@ -2054,6 +2070,291 @@ class DCQQRelayPlugin(Star):
             return value.replace(tzinfo=tz)
         return None
 
+    # -- 聊天绑定 -----------------------------------------------------------
+    def _capture_endpoint(self, event: AstrMessageEvent) -> dict:
+        """把当前会话抽象成一个可绑定的端点。"""
+        message_obj = event.message_obj
+        raw = message_obj.raw_message
+        platform_name = event.get_platform_name()
+        platform_id = event.get_platform_id() or platform_name
+        session_id = str(getattr(message_obj, "session_id", "") or "")
+
+        group = getattr(message_obj, "group", None)
+        group_id = (
+            str(getattr(group, "group_id", "") or "") if group is not None else ""
+        )
+        is_group = bool(group_id)
+        channel = group_id or session_id
+
+        channel_name = ""
+        if group is not None and getattr(group, "group_name", None):
+            channel_name = str(group.group_name)
+        raw_channel = getattr(raw, "channel", None)
+        if raw_channel is not None and getattr(raw_channel, "name", None):
+            channel_name = channel_name or str(raw_channel.name)
+        if not channel_name:
+            channel_name = f"{platform_name}:{channel}"
+
+        guild_id = ""
+        guild = getattr(raw, "guild", None)
+        if guild is not None:
+            guild_id = str(getattr(guild, "id", "") or "")
+
+        return {
+            "platform_name": platform_name,
+            "platform_id": str(platform_id),
+            "channel": channel,
+            "message_type": "GroupMessage" if is_group else "FriendMessage",
+            "guild_id": guild_id,
+            "channel_name": channel_name,
+            "session_id": session_id,
+        }
+
+    @staticmethod
+    def _endpoint_text(endpoint: dict) -> str:
+        name = endpoint.get("channel_name") or endpoint.get("channel")
+        return f"{endpoint.get('platform_name')} · {name}（{endpoint.get('channel')}）"
+
+    def _find_relation_for_endpoint(self, endpoint: dict):
+        platforms = {endpoint.get("platform_id"), endpoint.get("platform_name")}
+        for relation in self.relations:
+            if endpoint["platform_name"] == "discord":
+                if relation.discord_channel_id == endpoint["channel"]:
+                    return relation
+            elif (
+                relation.forward_platform in platforms
+                and relation.forward_channel == endpoint["channel"]
+            ):
+                return relation
+        return None
+
+    def _prune_bind_codes(self) -> None:
+        now = time.time()
+        for code, entry in list(self._bind_codes.items()):
+            if now - float(entry.get("created", 0)) > BIND_CODE_TTL:
+                self._bind_codes.pop(code, None)
+
+    def _new_bind_code(self) -> str:
+        for _ in range(100):
+            code = f"{random.randint(0, 999999):06d}"
+            if code not in self._bind_codes:
+                return code
+        raise RuntimeError("无法生成绑定码")
+
+    def _save_config_safe(self) -> bool:
+        save = getattr(self.config, "save_config", None)
+        if not callable(save):
+            return False
+        try:
+            save()
+            return True
+        except Exception as exc:
+            logger.warning("[dcqq-relay] 保存插件配置失败：%s", exc)
+            return False
+
+    @staticmethod
+    def _relation_matches(relation: Relation, item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        return (
+            str(item.get("discord_channel_id") or "").strip()
+            == relation.discord_channel_id
+            and str(item.get("forward_channel") or "").strip()
+            == relation.forward_channel
+            and str(item.get("forward_platform") or "").strip()
+            == relation.forward_platform
+        )
+
+    def _auto_relation_name(self, dc_endpoint: dict, other: dict) -> str:
+        left = dc_endpoint.get("channel_name") or f"discord:{dc_endpoint['channel']}"
+        right = other.get("channel_name") or f"{other['platform_name']}:{other['channel']}"
+        return f"{left} ⇄ {right}"[:60]
+
+    @filter.command("绑定", alias={"bind"})
+    async def bind(self, event: AstrMessageEvent, args: GreedyStr):
+        """生成绑定码，把当前会话与另一个频道/群互绑。"""
+        if not self._is_admin(event):
+            yield event.plain_result("只有管理员可以使用绑定功能。")
+            return
+        if not self._initialized:
+            yield event.plain_result("插件尚未初始化完成，请稍后再试。")
+            return
+
+        endpoint = self._capture_endpoint(event)
+        if not endpoint.get("channel"):
+            yield event.plain_result("无法识别当前会话，绑定失败。")
+            return
+
+        existing = self._find_relation_for_endpoint(endpoint)
+        if existing is not None:
+            yield event.plain_result(
+                f"当前会话已经在互通关系「{existing.name}」里了，无需重复绑定。"
+            )
+            return
+
+        self._prune_bind_codes()
+        code = self._new_bind_code()
+        self._bind_codes[code] = {
+            "endpoint": endpoint,
+            "name": str(args or "").strip()[:40],
+            "created": time.time(),
+            "creator": str(event.get_sender_id()),
+        }
+        minutes = max(1, BIND_CODE_TTL // 60)
+        logger.info("[dcqq-relay] 生成绑定码 %s（%s）", code, endpoint["channel"])
+        yield event.plain_result(
+            f"🔗 绑定码：{code}\n"
+            f"当前会话：{self._endpoint_text(endpoint)}\n\n"
+            f"请在 {minutes} 分钟内，到要互通的另一个频道/群发送：\n"
+            f"/完成绑定 {code}\n"
+            "（另一端同样需要管理员权限；其中一端必须是 Discord 频道）"
+        )
+
+    @filter.command("完成绑定", alias={"bindcode", "complete_bind"})
+    async def complete_bind(self, event: AstrMessageEvent, args: GreedyStr):
+        """使用 /绑定 生成的绑定码完成双向绑定。"""
+        if not self._is_admin(event):
+            yield event.plain_result("只有管理员可以使用绑定功能。")
+            return
+        if not self._initialized:
+            yield event.plain_result("插件尚未初始化完成，请稍后再试。")
+            return
+
+        code = "".join(str(args or "").split())
+        if not code or not code.isdigit():
+            yield event.plain_result("用法：/完成绑定 <绑定码>")
+            return
+
+        self._prune_bind_codes()
+        entry = self._bind_codes.get(code)
+        if entry is None:
+            yield event.plain_result("绑定码无效或已过期，请重新发送 /绑定 获取。")
+            return
+
+        first = entry["endpoint"]
+        current = self._capture_endpoint(event)
+        if (
+            first["platform_name"] == current["platform_name"]
+            and first["channel"] == current["channel"]
+        ):
+            yield event.plain_result("不能和同一个会话绑定，请到另一个频道/群完成绑定。")
+            return
+
+        dc_endpoints = [
+            point
+            for point in (first, current)
+            if point["platform_name"] == "discord"
+        ]
+        if len(dc_endpoints) != 1:
+            yield event.plain_result(
+                "绑定需要其中一端是 Discord 频道（两端都不是 / 两端都是 Discord 暂不支持）。"
+            )
+            return
+        dc_endpoint = dc_endpoints[0]
+        other = current if dc_endpoint is first else first
+
+        for relation in self.relations:
+            if (
+                relation.discord_channel_id == dc_endpoint["channel"]
+                and relation.forward_channel == other["channel"]
+                and relation.forward_platform
+                in {other["platform_id"], other["platform_name"]}
+            ):
+                self._bind_codes.pop(code, None)
+                yield event.plain_result(
+                    f"这两个会话已经绑定过了（{relation.name}），无需重复绑定。"
+                )
+                return
+
+        name = entry.get("name") or self._auto_relation_name(dc_endpoint, other)
+        record = {
+            "__template_key": "relation",
+            "name": name,
+            "discord_guild_id": dc_endpoint.get("guild_id", ""),
+            "discord_channel_id": dc_endpoint["channel"],
+            "forward_platform": other.get("platform_id") or other["platform_name"],
+            "forward_channel": other["channel"],
+            "forward_message_type": other["message_type"],
+            "show_forward_id": True,
+            "reverse_name": False,
+            "download_asset": False,
+        }
+        relations = list(self.config.get("relations") or [])
+        relations.append(record)
+        self.config["relations"] = relations
+        saved = self._save_config_safe()
+        self.relations = parse_relations(relations)
+        self._bind_codes.pop(code, None)
+        logger.info(
+            "[dcqq-relay] 聊天绑定完成：discord:%s ⇄ %s:%s",
+            dc_endpoint["channel"],
+            other["platform_name"],
+            other["channel"],
+        )
+
+        text = (
+            f"✅ 绑定完成：{name}\n"
+            f"Discord：{self._endpoint_text(dc_endpoint)}\n"
+            f"QQ 侧：{self._endpoint_text(other)}\n"
+            "双向同步已生效。"
+        )
+        if not saved:
+            text += (
+                "\n⚠️ 配置保存失败：本次运行有效，重启后会丢失。"
+                "请到 WebUI 手动把这条关系补进配置。"
+            )
+        yield event.plain_result(text)
+
+    @filter.command("解绑", alias={"unbind"})
+    async def unbind(self, event: AstrMessageEvent, args: GreedyStr):
+        """解除一条互通关系（按 /relay_status 里的序号）。"""
+        if not self._is_admin(event):
+            yield event.plain_result("只有管理员可以使用解绑功能。")
+            return
+
+        raw = str(args or "").strip()
+        if not raw.isdigit():
+            lines = ["用法：/解绑 <序号>", "当前关系："]
+            for index, relation in enumerate(self.relations, start=1):
+                lines.append(
+                    f"{index}. {relation.name}"
+                    f"（discord:{relation.discord_channel_id} ⇄ "
+                    f"{relation.forward_platform}:{relation.forward_channel}）"
+                )
+            if len(lines) == 2:
+                lines.append("（暂无）")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        index = int(raw) - 1
+        if index < 0 or index >= len(self.relations):
+            yield event.plain_result(
+                f"序号超出范围（当前共 {len(self.relations)} 条关系）。"
+            )
+            return
+
+        target = self.relations[index]
+        kept: list[Any] = []
+        removed = False
+        for item in list(self.config.get("relations") or []):
+            if not removed and self._relation_matches(target, item):
+                removed = True
+                continue
+            kept.append(item)
+        if not removed:
+            yield event.plain_result(
+                "在配置里没有找到这条关系，可能已被 WebUI 修改，请手动检查配置。"
+            )
+            return
+
+        self.config["relations"] = kept
+        saved = self._save_config_safe()
+        self.relations = parse_relations(kept)
+        text = f"已解绑：{target.name}"
+        if not saved:
+            text += "\n⚠️ 配置保存失败：重启后会恢复，请到 WebUI 手动删除。"
+        yield event.plain_result(text)
+
     # -- 指令 ---------------------------------------------------------------
     @filter.command("relay")
     async def relay(self, event: AstrMessageEvent):
@@ -2067,16 +2368,18 @@ class DCQQRelayPlugin(Star):
             return event.plain_result("插件尚未初始化完成，请稍后再试。")
 
         lines = [f"DC-QQ 互通：{len(self.relations)} 条关系"]
-        for relation in self.relations:
+        for index, relation in enumerate(self.relations, start=1):
             ready = self._recovery_ready.get(relation.forward_platform)
             state = ""
             if ready is not None:
                 state = "（已就绪）" if ready.is_set() else "（等待恢复）"
             lines.append(
-                f"• {relation.name}：discord:{relation.discord_channel_id} ⇄ "
+                f"{index}. {relation.name}：discord:{relation.discord_channel_id} ⇄ "
                 f"{relation.forward_platform}:{relation.forward_channel}"
                 f"（{'群聊' if relation.is_group else '私聊'}）{state}"
             )
+        if not self.relations:
+            lines.append("（暂无，可用 /绑定 + /完成绑定 在聊天里创建）")
         lines.append(f"消息映射记录：{await self.store.count()} 条")
         translation = self.config.get("translation") or {}
         lines.append(
@@ -2203,8 +2506,12 @@ class DCQQRelayPlugin(Star):
     def _help_text() -> str:
         return (
             "DC-QQ 互通插件\n"
-            "把 Discord 频道和 QQ 群双向连起来，配置在 WebUI 的插件设置里，"
-            "一条关系即双向，不需要分别配置两个方向。\n\n"
+            "把 Discord 频道和 QQ 群双向连起来。可以在 WebUI 插件设置里配置，"
+            "也可以直接在聊天里绑定（一条关系即双向）。\n\n"
+            "聊天绑定：\n"
+            "/绑定 — 当前会话生成 6 位绑定码（管理员）\n"
+            "/完成绑定 <绑定码> — 在另一个频道/群完成绑定（管理员）\n"
+            "/解绑 <序号> — 解除一条互通关系（管理员）\n\n"
             "指令：\n"
             "/relay — 显示本帮助\n"
             "/relay_status — 查看关系、映射数量、翻译与 Webhook 状态\n"

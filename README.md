@@ -5,6 +5,7 @@
 本项目是 [koishi-plugin-dcqq-relay](https://github.com/koishijs/koishi-plugin-dcqq-relay)（Apache-2.0，作者 [LTC](https://github.com/shigma)）的 AstrBot 移植版，并在此基础上增加了：
 
 - **一条配置即双向**：一条关系同时负责 Discord → QQ 和 QQ → Discord，不再需要分别配置两个方向
+- **聊天内绑定**：管理员在任一频道发 `/绑定` 拿到绑定码，到另一端发 `/完成绑定 <码>` 即可互通，无需手抄频道 ID
 - **忽略 @全体成员** 开关（`@everyone` / `@here` / `@全体成员`）
 - **LLM 自动翻译**：可分别为两个方向设置目标语言，使用 AstrBot 已配置的聊天模型
 - **Discord Webhook 身份发送**：让 QQ 用户的**昵称和头像**在 Discord 中直接显示
@@ -29,6 +30,44 @@ git clone https://github.com/xZhongjie/astrbot_plugin_dcqq_relay.git
 然后在 WebUI「插件」页重载插件（或重启 AstrBot）。
 
 依赖：`aiohttp`（AstrBot 本体已自带）。若要使用 Discord，需要已启用 AstrBot 的 `discord` 平台适配器。
+
+---
+
+## 聊天内绑定（推荐）
+
+不用手抄任何 ID，两步完成：
+
+1. 在 **Discord 频道** 或 **QQ 群** 里（需要管理员）发送：
+
+   ```
+   /绑定
+   ```
+
+   机器人会返回一个 6 位绑定码，例如 `483920`，有效期 5 分钟。  
+   也可以带名称：`/绑定 主群互通`。
+
+2. 到 **要互通的另一端** 发送：
+
+   ```
+   /完成绑定 483920
+   ```
+
+   绑定成功后立即开始双向同步，并自动写入插件配置（重启不丢）。
+
+```
+QQ 群  /绑定                    → 绑定码 483920
+Discord 频道  /完成绑定 483920   → ✅ 绑定完成，双向同步生效
+```
+
+说明：
+
+- 两端都必须是 **AstrBot 管理员**（或在 `admin_ids` 里）。
+- 其中一端必须是 **Discord 频道**，另一端可以是 QQ 群/私聊，也可以是 AstrBot 支持的其它平台会话。
+- 绑定码 5 分钟内有效、一次性使用；重复绑定同一组合会提示已绑定。
+- 解除绑定：`/解绑 1`（序号见 `/relay_status`），或到 WebUI 删除对应关系。
+- 如果配置保存失败（例如配置目录只读），绑定仍会在本次运行生效，但会提示你到 WebUI 手动补上。
+
+也可以继续在 WebUI 的「互通关系」里手动配置，两种方式等价。
 
 ---
 
@@ -119,6 +158,9 @@ git clone https://github.com/xZhongjie/astrbot_plugin_dcqq_relay.git
 
 | 指令 | 说明 |
 | --- | --- |
+| `/绑定 [名称]` | 当前会话生成 6 位绑定码（管理员） |
+| `/完成绑定 <绑定码>` | 在另一端完成绑定（管理员） |
+| `/解绑 <序号>` | 解除一条互通关系（管理员） |
 | `/relay` | 查看帮助 |
 | `/relay_status` | 查看互通关系、映射数量、翻译与 Webhook 状态 |
 | `/relay_recovery <开始时间> [平台ID\|all] [--dry]` | 恢复历史消息（管理员） |
