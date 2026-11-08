@@ -133,6 +133,8 @@ Discord 频道  /完成绑定 483920   → ✅ 绑定完成，双向同步生效
 | `translation.max_chars` | `1500` | 超过长度的文本不翻译 |
 | `translation.timeout` | `30` | 单次翻译超时（秒） |
 | `advanced.max_file_mb` | `20` | 单个媒体文件大小上限 |
+| `advanced.force_ipv4` | `true` | 强制 IPv4 下载媒体，避免 IPv6 导致图片/视频被截断 |
+| `advanced.download_chunk_kb` | `2048` | 媒体分片下载大小，`0` 关闭 |
 | `advanced.max_discord_chars` | `1900` | Discord 单条消息字符上限 |
 | `advanced.proxy` | 空 | 媒体下载代理；留空时 Discord 域名自动复用适配器的 `discord_proxy` |
 | `advanced.delete_sync` | `true` | 同步撤回 / 删除 |
@@ -209,6 +211,20 @@ Discord 频道 ──► 适配器事件 ──► 解析昵称/文本/附件/�
 ---
 
 ## 常见问题
+
+### QQ 文件/视频在 Discord 显示成 `[文件: xxx]`
+
+说明文件下载失败，插件回退成了占位文本。v1.2.0 起会：
+
+1. 从 OneBot 原始消息里取 `file_id`，依次调用 `get_group_file_url`、`get_private_file_url`、`get_file` 换取真实下载地址
+2. 用 `advanced.force_ipv4` 强制 IPv4，避免 IPv6 出网导致大文件被截断
+3. 用 `advanced.download_chunk_kb` 做 HTTP Range 分片下载
+
+排查：
+
+- 日志搜索 `文件下载失败`、`get_group_file_url 失败`
+- 确认协议端（NapCat）允许 `get_group_file_url` / `get_file`
+- 文件超过 `advanced.max_file_mb` 时会直接跳过，调大该值
 
 ### QQ 图片在 Discord 显示成 `[图片]`
 

@@ -196,6 +196,19 @@
         "default": 20,
         "slider": {"min": 1, "max": 100, "step": 1}
       },
+      "force_ipv4": {
+        "description": "强制 IPv4 下载",
+        "type": "bool",
+        "default": true,
+        "hint": "服务器 IPv6 出网不通时，QQ / Discord 媒体会在半途被截断（图片发不出、视频变成 [文件]）；开启后强制走 IPv4。只有 IPv6 的服务器请关闭。"
+      },
+      "download_chunk_kb": {
+        "description": "媒体分片下载大小（KB）",
+        "type": "int",
+        "default": 2048,
+        "slider": {"min": 0, "max": 8192, "step": 256},
+        "hint": "用 HTTP Range 分片下载大文件，绕过单连接截断；0 表示关闭，改用整包下载。"
+      },
       "max_discord_chars": {
         "description": "Discord 单条消息字符上限",
         "type": "int",

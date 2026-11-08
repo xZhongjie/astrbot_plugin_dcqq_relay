@@ -369,11 +369,14 @@ def sanitize_webhook_username(name: str) -> str:
 
 
 class HttpClient:
-    """复用 aiohttp session 的小封装，带体积上限与按 URL 选择代理。"""
+    """复用 aiohttp session 的小封装，带体积上限、按 URL 选择代理、强制 IPv4。"""
 
-    def __init__(self, max_bytes: int, proxy_resolver=None) -> None:
+    def __init__(
+        self, max_bytes: int, proxy_resolver=None, force_ipv4: bool = True
+    ) -> None:
         self.max_bytes = max_bytes
         self._proxy_resolver = proxy_resolver
+        self.force_ipv4 = force_ipv4
         self._session: aiohttp.ClientSession | None = None
 
     def _proxy_for(self, url: str) -> str | None:
@@ -397,8 +400,90 @@ class HttpClient:
                 "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             }
-            self._session = aiohttp.ClientSession(timeout=timeout, headers=headers)
+            connector = None
+            if self.force_ipv4:
+                # IPv6 出网不通时，大文件会在传输中途被截断
+                try:
+                    import socket
+
+                    connector = aiohttp.TCPConnector(family=socket.AF_INET)
+                except Exception:
+                    connector = None
+            self._session = aiohttp.ClientSession(
+                timeout=timeout, headers=headers, connector=connector
+            )
         return self._session
+
+    async def request_full(
+        self,
+        url: str,
+        *,
+        headers: dict | None = None,
+        timeout: float = 60,
+    ) -> tuple[int, bytes, dict]:
+        session = await self._get_session()
+        try:
+            async with session.get(
+                url,
+                headers=headers or {},
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                proxy=self._proxy_for(url),
+            ) as resp:
+                body = await resp.content.read(self.max_bytes + 1)
+                return resp.status, body, {k.lower(): v for k, v in resp.headers.items()}
+        except Exception as exc:
+            logger.warning("[dcqq-relay] 下载失败：%s（%s）", url[:200], exc)
+            return 0, b"", {}
+
+    async def download_range(
+        self,
+        url: str,
+        *,
+        headers: dict | None = None,
+        chunk_size: int = 2 * 1024 * 1024,
+        max_bytes: int = 0,
+        timeout: float = 120,
+    ) -> bytes | None:
+        """分片下载，绕过单连接被截断。支持 206 与整包 200。"""
+        if not url.startswith(("http://", "https://")):
+            return await self.get_bytes(url)
+        status, first, resp_headers = await self.request_full(
+            url,
+            headers={**(headers or {}), "Range": f"bytes=0-{chunk_size - 1}"},
+            timeout=timeout,
+        )
+        if status == 200:
+            return first or None
+        if status != 206 or not first:
+            return None
+        total = 0
+        content_range = resp_headers.get("content-range") or ""
+        if "/" in content_range:
+            try:
+                total = int(content_range.rsplit("/", 1)[-1])
+            except ValueError:
+                total = 0
+        data = bytearray(first)
+        offset = len(first)
+        while total and offset < total:
+            if max_bytes and offset >= max_bytes:
+                return None
+            end = min(offset + chunk_size - 1, total - 1)
+            status, part, _ = await self.request_full(
+                url,
+                headers={**(headers or {}), "Range": f"bytes={offset}-{end}"},
+                timeout=timeout,
+            )
+            if status not in (200, 206) or not part:
+                break
+            data.extend(part)
+            offset += len(part)
+        if total and len(data) < total:
+            logger.warning(
+                "[dcqq-relay] 分片下载不完整：期望 %d，实际 %d", total, len(data)
+            )
+            return None
+        return bytes(data)
 
     async def get_bytes(self, url: str) -> bytes | None:
         if not url:
@@ -965,6 +1050,16 @@ class DiscordSide:
                 out.append(value)
         return out
 
+    @staticmethod
+    def _uniq(values: list[str]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in values:
+            if value and value not in seen:
+                seen.add(value)
+                out.append(value)
+        return out
+
     def _media_fallback(self, seg: Any, kind: str) -> str:
         """下载失败时的占位：能拿到 http 链接就发链接，Discord 会自动展开预览。"""
         for value in self._candidates(seg):
@@ -1020,8 +1115,19 @@ class DiscordSide:
         except Exception as exc:
             logger.debug("[dcqq-relay] AstrBot 组件解析失败，尝试手动下载：%s", exc)
 
-        # 2) 手动下载所有候选地址
+        # 2) 手动下载所有候选地址（大文件用分片，避免连接被截断）
+        chunk_kb = int(
+            (self.plugin.config.get("advanced") or {}).get("download_chunk_kb") or 0
+        )
         for candidate in self._candidates(seg):
+            if candidate.startswith(("http://", "https://")) and chunk_kb > 0:
+                data = await self.plugin.http.download_range(
+                    candidate,
+                    chunk_size=chunk_kb * 1024,
+                    max_bytes=max_bytes,
+                )
+                if data:
+                    return data
             data = await self.plugin.http.get_bytes(candidate)
             if data:
                 return data
@@ -1377,7 +1483,11 @@ class DCQQRelayPlugin(Star):
         self._data_dir = StarTools.get_data_dir(PLUGIN_NAME)
         max_mb = int((self.config.get("advanced") or {}).get("max_file_mb") or 20)
         self.http = HttpClient(
-            max_mb * 1024 * 1024, proxy_resolver=self._download_proxy
+            max_mb * 1024 * 1024,
+            proxy_resolver=self._download_proxy,
+            force_ipv4=bool(
+                (self.config.get("advanced") or {}).get("force_ipv4", True)
+            ),
         )
         self.store = RelayStore(self._data_dir / "relay.db")
         await self.store.init()
@@ -1984,9 +2094,37 @@ class DCQQRelayPlugin(Star):
             return f"{display} (@{username})"
         return f"@{username or display}"
 
+    @staticmethod
+    def _raw_media_segments(message_obj: Any) -> dict[str, list[dict]]:
+        """从 OneBot 原始消息里取出 file/video/image/record 段，用于补全 file_id。"""
+        out: dict[str, list[dict]] = {"file": [], "video": [], "image": [], "record": []}
+        raw = getattr(message_obj, "raw_message", None)
+        try:
+            message = raw.get("message") if hasattr(raw, "get") else None
+        except Exception:
+            message = None
+        if not isinstance(message, list):
+            return out
+        for item in message:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("type") or "")
+            if kind not in out:
+                continue
+            data = item.get("data")
+            if isinstance(data, dict):
+                out[kind].append(data)
+        return out
+
     async def _build_qq_parts(self, message_obj: Any, relation: Relation) -> list[Any]:
         parts: list[Any] = []
         ignore_at_all = bool(self.config.get("ignore_at_all", True))
+        raw_media = self._raw_media_segments(message_obj)
+        queues: dict[str, list[dict]] = {key: list(value) for key, value in raw_media.items()}
+
+        def take(kind: str) -> dict | None:
+            queue = queues.get(kind) or []
+            return queue.pop(0) if queue else None
 
         for seg in message_obj.message or []:
             if isinstance(seg, Comp.Plain):
@@ -2004,19 +2142,27 @@ class DCQQRelayPlugin(Star):
                 )
                 parts.append(Comp.Plain(f"[{description}]"))
             elif isinstance(seg, Comp.Image):
-                ref = await self._resolve_media_ref(relation, seg, "image")
+                ref = await self._resolve_media_ref(
+                    relation, seg, "image", take("image")
+                )
                 parts.append(
                     Comp.Image(file=ref, url=ref if ref.startswith("http") else "")
                 )
             elif isinstance(seg, Comp.Record):
-                ref = await self._resolve_media_ref(relation, seg, "record")
+                ref = await self._resolve_media_ref(
+                    relation, seg, "record", take("record")
+                )
                 suffix = os.path.splitext(guess_filename(ref, ""))[1] or ".amr"
                 parts.append(Comp.File(name=f"语音{suffix}", url=ref))
             elif isinstance(seg, Comp.Video):
-                ref = await self._resolve_media_ref(relation, seg, "video")
+                ref = await self._resolve_media_ref(
+                    relation, seg, "video", take("video")
+                )
                 parts.append(Comp.File(name="视频.mp4", url=ref))
             elif isinstance(seg, Comp.File):
-                ref = await self._resolve_media_ref(relation, seg, "file")
+                ref = await self._resolve_media_ref(
+                    relation, seg, "file", take("file")
+                )
                 parts.append(Comp.File(name=seg.name or "文件", url=ref))
             elif isinstance(seg, Comp.Reply):
                 if self.store is None:
@@ -2033,14 +2179,21 @@ class DCQQRelayPlugin(Star):
         return parts
 
     async def _resolve_media_ref(
-        self, relation: Relation, seg: Any, kind: str
+        self, relation: Relation, seg: Any, kind: str, raw: dict | None = None
     ) -> str:
         """把消息组件的资源引用解析成可直接下载的地址。
 
         有些 OneBot 实现（如部分 NapCat / go-cqhttp 配置）的图片段只有裸文件名，
-        没有 http url，这时调用协议端的 get_image 换取真实链接。
+        没有 http url，这时调用协议端的 get_image 换取真实链接；文件/视频段还会
+        用原始消息里的 file_id 调 get_group_file_url / get_private_file_url / get_file。
         """
         candidates = DiscordSide._candidates(seg)
+        if isinstance(raw, dict):
+            for key in ("url", "file", "path"):
+                value = raw.get(key)
+                if isinstance(value, str) and value:
+                    candidates.append(value)
+        candidates = DiscordSide._uniq(candidates)
         for value in candidates:
             if value.startswith(("http://", "https://", "base64://", "data:", "file://")):
                 return value
@@ -2050,26 +2203,69 @@ class DCQQRelayPlugin(Star):
             except OSError:
                 continue
 
-        ref = DiscordSide._first_ref(seg)
-        if not ref or self.qq is None:
+        if self.qq is None:
             return ""
         client = self.qq.client(relation.forward_platform)
         if client is None:
             return ""
+
+        # 1) 图片 / 语音：走协议端专用接口
+        ref = DiscordSide._first_ref(seg)
         action = {"image": "get_image", "record": "get_record"}.get(kind)
-        if not action:
-            return ""
-        try:
-            ret = await client.call_action(action, file=ref)
-        except Exception as exc:
-            logger.debug("[dcqq-relay] %s 解析媒体失败（%s）：%s", action, ref[:80], exc)
-            return ""
+        if action and ref:
+            try:
+                ret = await client.call_action(action, file=ref)
+            except Exception as exc:
+                logger.debug("[dcqq-relay] %s 解析媒体失败（%s）：%s", action, ref[:80], exc)
+                ret = None
+            url = self._extract_media_url(ret)
+            if url:
+                logger.info("[dcqq-relay] 已通过 %s 解析出媒体链接（%s）", action, ref[:60])
+                return url
+
+        # 2) 文件 / 视频：用原始消息里的 file_id 换取下载地址
+        if kind in ("file", "video") and isinstance(raw, dict):
+            file_id = raw.get("file_id") or raw.get("fileId") or raw.get("file")
+            group_id = raw.get("group_id") or relation.forward_channel
+            if file_id:
+                url = await self._resolve_file_url(client, str(group_id or ""), str(file_id), raw)
+                if url:
+                    return url
+        return ""
+
+    @staticmethod
+    def _extract_media_url(ret: Any) -> str:
         if isinstance(ret, dict):
-            url = ret.get("url") or ret.get("file")
-            if isinstance(url, str) and url.startswith(("http://", "https://")):
-                logger.info(
-                    "[dcqq-relay] 已通过 %s 解析出媒体链接（%s）", action, ref[:60]
+            for key in ("url", "file", "file_url"):
+                value = ret.get(key)
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    return value
+        return ""
+
+    async def _resolve_file_url(
+        self, client: Any, group_id: str, file_id: str, raw: dict
+    ) -> str:
+        busid = raw.get("busid") or 0
+        attempts: list[tuple[str, dict]] = []
+        if group_id:
+            attempts.append(
+                (
+                    "get_group_file_url",
+                    {"group_id": int(group_id) if group_id.isdigit() else group_id,
+                     "file_id": file_id, "busid": busid},
                 )
+            )
+        attempts.append(("get_private_file_url", {"file_id": file_id}))
+        attempts.append(("get_file", {"file_id": file_id}))
+        for action, params in attempts:
+            try:
+                ret = await client.call_action(action, **params)
+            except Exception as exc:
+                logger.debug("[dcqq-relay] %s 失败：%s", action, exc)
+                continue
+            url = self._extract_media_url(ret)
+            if url:
+                logger.info("[dcqq-relay] 已通过 %s 解析出文件链接（%s）", action, file_id[:60])
                 return url
         return ""
 
