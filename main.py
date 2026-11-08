@@ -810,6 +810,7 @@ class DiscordSide:
         self._channels: dict[int, Any] = {}
         self._webhooks: dict[int, Any] = {}
         self._webhook_unavailable = False
+        self._webhook_retry_at = 0.0
 
     # -- 基础访问 -----------------------------------------------------------
     @property
@@ -928,6 +929,7 @@ class DiscordSide:
                 )
                 self._webhooks.pop(getattr(channel, "id", 0), None)
                 self._webhook_unavailable = True
+                self._webhook_retry_at = time.time() + 300
                 kwargs.pop("username", None)
                 kwargs.pop("avatar_url", None)
                 kwargs["content"] = with_prefix
@@ -1143,7 +1145,8 @@ class DiscordSide:
         return name
 
     async def _get_webhook(self, channel):
-        if discord is None or self._webhook_unavailable:
+        # 失败后不要永久禁用：权限可能后来才授予，每 5 分钟重试一次
+        if discord is None or time.time() < self._webhook_retry_at:
             return None
         cfg = self.plugin.config.get("discord_webhook") or {}
         if not cfg.get("enabled", True):
@@ -1160,6 +1163,8 @@ class DiscordSide:
             if webhook is None:
                 webhook = await channel.create_webhook(name=name)
             self._webhooks[cid] = webhook
+            self._webhook_unavailable = False
+            self._webhook_retry_at = 0.0
             logger.info(
                 "[dcqq-relay] 已启用 Discord Webhook「%s」（频道 %s）", name, cid
             )
@@ -1167,10 +1172,11 @@ class DiscordSide:
         except Exception as exc:
             logger.warning(
                 "[dcqq-relay] 无法使用 Webhook（需要「管理 Webhook」权限），"
-                "改用机器人身份发送：%s",
+                "改用机器人身份发送，5 分钟后重试：%s",
                 exc,
             )
             self._webhook_unavailable = True
+            self._webhook_retry_at = time.time() + 300
             return None
 
 
@@ -2856,7 +2862,10 @@ class DCQQRelayPlugin(Star):
         )
         webhook = self.config.get("discord_webhook") or {}
         if self.dc is not None and self.dc._webhook_unavailable:
-            webhook_state = "已尝试但不可用（已回退为机器人身份）"
+            wait = max(0, int(self.dc._webhook_retry_at - time.time()))
+            webhook_state = (
+                f"已回退为机器人身份（检查「管理 Webhook」权限，{wait} 秒后重试）"
+            )
         else:
             webhook_state = "开启" if webhook.get("enabled", True) else "关闭"
         lines.append(f"Discord Webhook 身份：{webhook_state}")
