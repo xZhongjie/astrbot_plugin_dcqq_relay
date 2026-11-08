@@ -885,14 +885,24 @@ class DiscordSide:
         max_chars = int(
             (self.plugin.config.get("advanced") or {}).get("max_discord_chars") or 1900
         )
+        webhook = await self._get_webhook(channel)
         plain_content = payload.content
         with_prefix = (fallback_prefix + plain_content).strip()
+
+        # Webhook 不支持 reply（reference 参数会直接 TypeError），改用引用文本
+        ref = reference_id or payload.reference_id
+        quote_text = ""
+        if ref and webhook is not None:
+            quote_text = await self._quote_reference(channel, ref)
+            if quote_text:
+                plain_content = f"{quote_text}\n{plain_content}".strip()
+                with_prefix = f"{quote_text}\n{with_prefix}".strip()
+
         if len(with_prefix) > max_chars:
             with_prefix = with_prefix[:max_chars].rstrip() + "\n…（消息过长已截断）"
         if len(plain_content) > max_chars:
             plain_content = plain_content[:max_chars].rstrip() + "\n…（消息过长已截断）"
 
-        webhook = await self._get_webhook(channel)
         content = plain_content if webhook is not None else with_prefix
         if not content and not payload.files:
             return None
@@ -903,8 +913,7 @@ class DiscordSide:
         if payload.files:
             kwargs["files"] = payload.files[:10]
 
-        ref = reference_id or payload.reference_id
-        if ref:
+        if ref and webhook is None:
             try:
                 kwargs["reference"] = discord.PartialMessage(
                     channel=channel, id=int(str(ref))
@@ -947,6 +956,25 @@ class DiscordSide:
         except Exception as exc:
             logger.error("[dcqq-relay] 发送消息到 Discord 失败：%s", exc)
             return None
+
+    async def _quote_reference(self, channel, ref: Any) -> str:
+        """Webhook 不支持 reply，拉取被引用消息生成引用文本。"""
+        try:
+            message = await channel.fetch_message(int(str(ref)))
+        except Exception as exc:
+            logger.debug("[dcqq-relay] 拉取被引用消息失败（%s）：%s", ref, exc)
+            return ""
+        author = getattr(getattr(message, "author", None), "display_name", "") or "未知"
+        text = (getattr(message, "content", "") or "").replace("\n", " ").strip()
+        if not text and getattr(message, "embeds", None):
+            embeds = message.embeds
+            title = getattr(embeds[0], "title", "") if embeds else ""
+            text = str(title or "")
+        if not text:
+            return ""
+        if len(text) > 80:
+            text = text[:80] + "…"
+        return f"> 回复 {author}：{text}"
 
     async def delete(self, channel_id: Any, message_id: Any) -> bool:
         channel = await self.get_channel(channel_id)
