@@ -928,9 +928,13 @@ class DiscordSide:
                 logger.warning(
                     "[dcqq-relay] Webhook 发送失败，回退为机器人身份：%s", exc
                 )
-                self._webhooks.pop(getattr(channel, "id", 0), None)
-                self._webhook_unavailable = True
-                self._webhook_retry_at = time.time() + 300
+                # 只有权限/Token/删除这类永久性错误才禁用 Webhook；
+                # 限流、网络抖动等临时错误保留缓存，下一条继续用 Webhook。
+                status = getattr(exc, "status", None) or getattr(exc, "code", None)
+                if status in (401, 403, 404):
+                    self._webhooks.pop(getattr(channel, "id", 0), None)
+                    self._webhook_unavailable = True
+                    self._webhook_retry_at = time.time() + 300
                 kwargs.pop("username", None)
                 kwargs.pop("avatar_url", None)
                 kwargs["content"] = with_prefix

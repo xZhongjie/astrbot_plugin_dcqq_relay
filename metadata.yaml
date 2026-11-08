@@ -2,7 +2,7 @@ name: astrbot_plugin_dcqq_relay
 display_name: DC-QQ 互通
 desc: 在 Discord 与 QQ（以及任意 AstrBot 平台）之间双向同步消息。支持忽略 @全体、LLM 自动翻译、撤回/编辑同步、历史消息恢复，并可通过 Discord Webhook 还原 QQ 用户的昵称与头像。
 short_desc: Discord 与 QQ 群双向消息互通
-version: v1.2.3
+version: v1.2.4
 author: xZhongjie
 repo: https://github.com/xZhongjie/astrbot_plugin_dcqq_relay
 astrbot_version: ">=4.10.4"
