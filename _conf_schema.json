@@ -133,6 +133,12 @@
         "type": "bool",
         "default": true,
         "hint": "QQ 头像通过 qlogo 地址提供，仅 aiocqhttp 等 QQ 平台有效。"
+      },
+      "webhook_url": {
+        "description": "手动 Webhook URL（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "频道设置 → 整合 → Webhook → 新建并复制 URL，填到这里可绕过机器人「管理 Webhook」权限。留空则自动创建。"
       }
     }
   },

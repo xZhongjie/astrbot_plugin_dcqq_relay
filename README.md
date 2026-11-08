@@ -227,9 +227,10 @@ QQ 的「回复」只带被回复消息的 id。v1.2.2 起：
 说明 Webhook 身份伪装没有生效，插件回退成了机器人身份。原因和修复：
 
 1. **机器人缺少「管理 Webhook」权限**：在频道设置 → 权限 → 给机器人勾选「管理 Webhook」（或给它管理员权限），v1.2.1 起每 5 分钟自动重试，不用重启
-2. **`discord_webhook.enabled` 被关**：打开它
-3. **`discord_webhook.show_avatar` 被关**：打开后才会显示 QQ 头像
-4. 用 `/relay_status` 查看 Webhook 状态；日志里搜 `无法使用 Webhook`
+2. **使用手动 Webhook URL（推荐，绕过权限）**：频道设置 → 整合 → Webhook → 新建 Webhook → 复制 URL，填到配置 `discord_webhook.webhook_url`。这样即使机器人没有「管理 Webhook」权限也能以 QQ 用户身份发送
+3. **`discord_webhook.enabled` 被关**：打开它
+4. **`discord_webhook.show_avatar` 被关**：打开后才会显示 QQ 头像
+5. 用 `/relay_status` 查看 Webhook 状态和具体错误；日志里搜 `无法使用 Webhook`
 
 注意：**Discord → QQ 方向**无法伪装 QQ 头像/昵称，OneBot 发送的消息只能使用机器人自己的资料，这是协议限制，只能靠文本前缀区分。
 
