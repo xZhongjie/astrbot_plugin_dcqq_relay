@@ -2171,15 +2171,21 @@ class DCQQRelayPlugin(Star):
                 )
                 parts.append(Comp.File(name=seg.name or "文件", url=ref))
             elif isinstance(seg, Comp.Reply):
-                if self.store is None:
-                    continue
-                rows = await self.store.by_forward(
-                    relation.forward_platform,
-                    relation.forward_channel,
-                    str(seg.id),
-                )
-                if rows:
-                    parts.append(Comp.Reply(id=rows[0].dc_id))
+                mapped = False
+                if self.store is not None:
+                    rows = await self.store.by_forward(
+                        relation.forward_platform,
+                        relation.forward_channel,
+                        str(seg.id),
+                    )
+                    if rows:
+                        parts.append(Comp.Reply(id=rows[0].dc_id))
+                        mapped = True
+                if not mapped:
+                    # 被回复的消息没有转发记录（QQ 原生消息），拉取原文做引用
+                    quote = await self._qq_reply_quote(relation, str(seg.id))
+                    if quote:
+                        parts.append(Comp.Plain(quote))
             else:
                 continue
         return parts
@@ -2275,6 +2281,52 @@ class DCQQRelayPlugin(Star):
                 return url
         return ""
 
+    async def _qq_reply_quote(self, relation: Relation, message_id: str) -> str:
+        """用 OneBot get_msg 拉取被回复消息的原文，生成引用文本。"""
+        if self.qq is None or not message_id:
+            return ""
+        client = self.qq.client(relation.forward_platform)
+        if client is None:
+            return ""
+        params: dict[str, Any] = {"message_id": message_id}
+        if message_id.isdigit():
+            params["message_id"] = int(message_id)
+        try:
+            ret = await client.call_action("get_msg", **params)
+        except Exception as exc:
+            logger.debug("[dcqq-relay] get_msg 失败（%s）：%s", message_id, exc)
+            return ""
+        if not isinstance(ret, dict):
+            return ""
+        sender = ret.get("sender") or {}
+        name = ""
+        if isinstance(sender, dict):
+            name = str(sender.get("card") or sender.get("nickname") or "")
+        text_parts: list[str] = []
+        segments = ret.get("message")
+        if isinstance(segments, list):
+            for item in segments:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text":
+                    data = item.get("data") or {}
+                    value = data.get("text")
+                    if isinstance(value, str):
+                        text_parts.append(value)
+                elif item.get("type") == "at":
+                    data = item.get("data") or {}
+                    qq = data.get("qq")
+                    if qq:
+                        text_parts.append(f"@{qq}")
+        text = "".join(text_parts).strip()
+        if not text:
+            return ""
+        text = text.replace("\n", " ")
+        if len(text) > 80:
+            text = text[:80] + "…"
+        name = name or "QQ 用户"
+        return f"> 回复 {name}：{text}"
+
     async def _translate_parts(self, parts: list[Any], direction: str) -> list[Any]:
         if self.translator is None:
             return parts
@@ -2287,7 +2339,9 @@ class DCQQRelayPlugin(Star):
         indexes = [
             index
             for index, part in enumerate(parts)
-            if isinstance(part, Comp.Plain) and (part.text or "").strip()
+            if isinstance(part, Comp.Plain)
+            and (part.text or "").strip()
+            and not (part.text or "").strip().startswith(("@", ">"))
         ]
         if not indexes:
             return parts
